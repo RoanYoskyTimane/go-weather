@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sync"
+	"time"
 )
 
 type GeocodingResult struct {
@@ -59,22 +61,48 @@ type APIResponse struct {
 	Temperature string `json:"temperature"`
 }
 
+type CacheEntry struct {
+	Data      []byte
+	CreatedAt time.Time
+}
+
+type Cache struct {
+	mu    sync.RWMutex
+	items map[string]CacheEntry
+}
+
 func main() {
 	client := &http.Client{}
 
-	http.HandleFunc("/api/v1/weather", weatherHandler(client))
-	http.HandleFunc("/api/v1/forecast", weatherForDays(client))
+	cache := &Cache{
+		items: make(map[string]CacheEntry),
+	}
+
+	http.HandleFunc("/api/v1/weather", weatherHandler(client, cache))
+	http.HandleFunc("/api/v1/forecast", weatherForDays(client, cache))
 	log.Println("Server running on http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-func weatherHandler(client *http.Client) http.HandlerFunc {
+func weatherHandler(client *http.Client, cache *Cache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cityName := r.URL.Query().Get("city")
 		if cityName == "" {
 			http.Error(w, "city name is required", http.StatusBadRequest)
 			return
 		}
+
+		cache.mu.RLock()
+		entry, found := cache.items[cityName]
+		cache.mu.RUnlock()
+		if found && time.Since(entry.CreatedAt) < 5*time.Minute {
+			log.Println("Cache hit! Returning cached data")
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(entry.Data)
+			return
+		}
+
+		log.Println("Cache miss! Fetching from Open-Meteo")
 
 		location, err := getCoordinates(client, cityName)
 		if err != nil {
@@ -88,17 +116,29 @@ func weatherHandler(client *http.Client) http.HandlerFunc {
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(APIResponse{
+		response := APIResponse{
 			City:        location.Name,
 			Country:     location.Country,
 			Temperature: fmt.Sprintf("%.1f%s", weather.Current.Temperature2m, weather.CurrentUnits.Temperature2m),
-		})
+		}
+
+		jsonBytes, _ := json.Marshal(response)
+
+		cache.mu.Lock()
+		cache.items[cityName] = CacheEntry{
+			Data:      jsonBytes,
+			CreatedAt: time.Now(),
+		}
+		cache.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+
 	}
 
 }
 
-func weatherForDays(client *http.Client) http.HandlerFunc {
+func weatherForDays(client *http.Client, cache *Cache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cityName := r.URL.Query().Get("city")
 		if cityName == "" {
@@ -111,6 +151,21 @@ func weatherForDays(client *http.Client) http.HandlerFunc {
 			http.Error(w, "days is required", http.StatusBadRequest)
 			return
 		}
+
+		cacheKey := fmt.Sprintf("%s:%s", url.QueryEscape(cityName), days)
+
+		cache.mu.RLock()
+		entry, found := cache.items[cacheKey]
+		cache.mu.RUnlock()
+
+		if found && time.Since(entry.CreatedAt) < 5*time.Minute {
+			log.Println("Forecast Cache HIT for key:", cacheKey)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(entry.Data)
+			return
+		}
+
+		log.Println("Forecast Cache MISS for key:", cacheKey)
 
 		location, err := getCoordinates(client, cityName)
 		if err != nil {
@@ -133,12 +188,23 @@ func weatherForDays(client *http.Client) http.HandlerFunc {
 			})
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(ForecastAPIResponse{
+		response := ForecastAPIResponse{
 			City:      location.Name,
 			Country:   location.Country,
 			Forecasts: forecasts,
-		})
+		}
+
+		jsonBytes, _ := json.Marshal(response)
+
+		cache.mu.Lock()
+		cache.items[cacheKey] = CacheEntry{
+			Data:      jsonBytes,
+			CreatedAt: time.Now(),
+		}
+		cache.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
 	}
 }
 
